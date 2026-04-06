@@ -11,6 +11,15 @@ export class MultiplayerManager extends SimpleEventEmitter {
     private host?: Host;
     private client?: Client;
 
+    /** Close any host/client sockets so a new room can be created */
+    cleanupConnections() {
+        this.host?.close();
+        this.host = undefined;
+        this.client?.disconnect();
+        this.client = undefined;
+        this.role = undefined;
+    }
+
     async scanLocalNetwork(port = 5000): Promise<string[]> {
         const state = await NetInfo.fetch();
         if (!state.isConnected || !state.details || !('ipAddress' in state.details)) {
@@ -58,17 +67,25 @@ export class MultiplayerManager extends SimpleEventEmitter {
     }
 
     async startAsHost(port = 5000) {
+        this.cleanupConnections();
         this.role = 'host';
         this.host = new Host();
         await this.host.start(port);
-        this.host.on('move', move => this.emit('move', move));
+        this.host.on('move', (...args: unknown[]) => {
+            const m = args[0];
+            if (typeof m === 'string') void this.emit('move', m);
+        });
     }
 
     async startAsClient(ip: string, port = 5000) {
+        this.cleanupConnections();
         this.role = 'client';
         this.client = new Client(ip);
         await this.client.connect(port);
-        this.client.on('move', move => this.emit('move', move));
+        this.client.on('move', (...args: unknown[]) => {
+            const m = args[0];
+            if (typeof m === 'string') void this.emit('move', m);
+        });
     }
 
     sendMove(move: string) {

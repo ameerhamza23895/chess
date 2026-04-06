@@ -26,6 +26,21 @@ export class Client extends SimpleEventEmitter {
     }
 
     sendMove(move: string) {
-        this.socket?.write(move);
+        try {
+            this.socket?.write(move);
+        } catch {
+            /* ignore */
+        }
+    }
+
+    disconnect() {
+        if (this.socket) {
+            try {
+                this.socket.destroy();
+            } catch {
+                /* ignore */
+            }
+            this.socket = undefined;
+        }
     }
 }

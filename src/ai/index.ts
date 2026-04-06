@@ -19,11 +19,15 @@ export function makeAIMove(game: Chess, level: AILevel) {
         case 'advanced':
             makeAdvancedMove(game);
             break;
-        case 'grandmaster':
-            game.move(getBestMove(game, 3));
+        case 'grandmaster': {
+            const m = getBestMove(game, 3);
+            if (m) game.move(m);
             break;
-        case 'unbeatable':
-            game.move(getBestMove(game, 4));
+        }
+        case 'unbeatable': {
+            const m = getBestMove(game, 4);
+            if (m) game.move(m);
             break;
+        }
     }
 }

@@ -112,7 +112,7 @@ const ChessBoard = forwardRef<ChessBoardRef, ChessBoardProps>(
         );
 
         useEffect(() => {
-            if (!multiplayerManager) return;
+            if (!multiplayerManager || localColor == null) return;
 
             const handleRemoteMove = (...args: unknown[]) => {
                 const moveStr = args[0];
@@ -137,7 +137,7 @@ const ChessBoard = forwardRef<ChessBoardRef, ChessBoardProps>(
             return () => {
                 multiplayerManager.off('move', handleRemoteMove);
             };
-        }, [multiplayerManager, game, forceUpdate]);
+        }, [multiplayerManager, localColor, game, forceUpdate]);
 
         const flashIllegal = useCallback(
             (square: Square) => {
@@ -152,8 +152,9 @@ const ChessBoard = forwardRef<ChessBoardRef, ChessBoardProps>(
             [onFeedback]
         );
 
+        /** Multiplayer is active only after host/join (localColor set), not merely when MultiplayerManager exists */
         const runAiIfNeeded = useCallback(() => {
-            if (multiplayerManager || game.isGameOver()) return;
+            if (localColor != null || game.isGameOver()) return;
             aiThinking.current = true;
             setTimeout(() => {
                 makeAIMove(game, aiLevel);
@@ -166,7 +167,7 @@ const ChessBoard = forwardRef<ChessBoardRef, ChessBoardProps>(
                 aiThinking.current = false;
                 forceUpdate();
             }, 350);
-        }, [aiLevel, forceUpdate, game, multiplayerManager, playSoundsForMove]);
+        }, [aiLevel, forceUpdate, game, localColor, playSoundsForMove]);
 
         const findKingSquare = (color: 'w' | 'b'): Square | null => {
             const b = game.board();
@@ -222,8 +223,8 @@ const ChessBoard = forwardRef<ChessBoardRef, ChessBoardProps>(
                         applyLocalMove(move);
                         setSelected(null);
                         setLegalTargets(new Map());
-                        multiplayerManager?.sendMove(move.san);
-                        if (!multiplayerManager) runAiIfNeeded();
+                        if (localColor != null) multiplayerManager?.sendMove(move.san);
+                        else runAiIfNeeded();
                     }
                     return;
                 }
@@ -260,8 +261,8 @@ const ChessBoard = forwardRef<ChessBoardRef, ChessBoardProps>(
                 const move = game.move({ from, to, promotion: p });
                 if (move) {
                     applyLocalMove(move);
-                    multiplayerManager?.sendMove(move.san);
-                    if (!multiplayerManager) runAiIfNeeded();
+                    if (localColor != null) multiplayerManager?.sendMove(move.san);
+                    else runAiIfNeeded();
                 }
             } catch {
                 onFeedback?.('Illegal move');

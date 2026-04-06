@@ -80,8 +80,9 @@ export function minimax(
     }
 }
 
-export function getBestMove(game: Chess, depth: number): string {
+export function getBestMove(game: Chess, depth: number): string | null {
     const moves = game.moves();
+    if (moves.length === 0) return null;
     let bestMove = moves[0];
     let bestValue = -Infinity;
     const isWhite = game.turn() === 'w';
