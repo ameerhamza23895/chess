@@ -1,6 +1,20 @@
 import React, { useState, useRef, useCallback, useEffect } from 'react';
-import { View, Text, StyleSheet, TouchableOpacity, ScrollView, Modal, ActivityIndicator, Alert } from 'react-native';
+import {
+    View,
+    Text,
+    StyleSheet,
+    TouchableOpacity,
+    ScrollView,
+    Modal,
+    ActivityIndicator,
+    Alert,
+    TextInput,
+    KeyboardAvoidingView,
+    Platform,
+} from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
+import * as Linking from 'expo-linking';
+import NetInfo from '@react-native-community/netinfo';
 import ChessBoard, { ChessBoardRef } from '../components/ChessBoard';
 import { Chess } from 'chess.js';
 import { AILevel } from '../ai';
@@ -8,6 +22,23 @@ import { useTheme, Themes } from '../themes';
 import { MultiplayerManager } from '../multiplayer/MultiplayerManager';
 import StatusBar from '../components/StatusBar';
 import AIDifficulty from '../components/AIDifficulty';
+import RoomInvitePanel from '../components/RoomInvitePanel';
+import {
+    buildInviteUrl,
+    parseInviteUrl,
+    parseInviteFromPastedText,
+    DEFAULT_CHESS_PORT,
+} from '../multiplayer/protocol';
+import { isTcpSocketsAvailable, TcpModuleUnavailableError } from '../multiplayer/tcpGuard';
+
+async function getLanIPv4(): Promise<string | null> {
+    const state = await NetInfo.fetch();
+    if (!state.isConnected || !state.details || !('ipAddress' in state.details)) {
+        return null;
+    }
+    const ip = state.details.ipAddress as string;
+    return ip && /^\d+\.\d+\.\d+\.\d+$/.test(ip) ? ip : null;
+}
 
 export default function GameScreen() {
     const { theme, setTheme } = useTheme();
@@ -27,6 +58,16 @@ export default function GameScreen() {
     const boardRef = useRef<ChessBoardRef>(null);
     const [, setBoardTick] = useState(0);
 
+    const [hostRoomPassword, setHostRoomPassword] = useState('');
+    const [joinIp, setJoinIp] = useState('');
+    const [joinPort, setJoinPort] = useState(String(DEFAULT_CHESS_PORT));
+    const [joinRoomPassword, setJoinRoomPassword] = useState('');
+    const [pasteInvite, setPasteInvite] = useState('');
+    const [mpPanel, setMpPanel] = useState<'menu' | 'hostQr'>('menu');
+    const [inviteUrl, setInviteUrl] = useState('');
+    const [localIpShown, setLocalIpShown] = useState('');
+    const [hostHasPassword, setHostHasPassword] = useState(false);
+
     const onBoardUpdate = useCallback(() => {
         setBoardTick(v => v + 1);
     }, []);
@@ -36,16 +77,63 @@ export default function GameScreen() {
         setMultiplayerManager(mgr);
     }, []);
 
+    useEffect(() => {
+        const handleUrl = (url: string | null) => {
+            if (!url) return;
+            const p = parseInviteUrl(url);
+            if (p) {
+                setJoinIp(p.ip);
+                setJoinPort(String(p.port));
+                setJoinRoomPassword(p.password);
+                setIsMultiplayerOpen(true);
+                setMpPanel('menu');
+                Alert.alert('Invite link', 'Connection details filled in. Tap Join as Black.');
+            }
+        };
+        Linking.getInitialURL().then(handleUrl).catch(() => {});
+        const sub = Linking.addEventListener('url', e => handleUrl(e.url));
+        return () => sub.remove();
+    }, []);
+
     const handleThemeChange = (name: string) => {
         setTheme(name);
     };
 
+    const resetMpUi = () => {
+        setMpPanel('menu');
+        setPasteInvite('');
+    };
+
+    const openMultiplayerModal = () => {
+        resetMpUi();
+        setIsMultiplayerOpen(true);
+    };
+
+    const closeMultiplayerModal = () => {
+        setIsMultiplayerOpen(false);
+        resetMpUi();
+    };
+
+    const endMultiplayerSession = () => {
+        multiplayerManager?.cleanupConnections();
+        setLocalColor(null);
+        resetMpUi();
+    };
+
     const startScanning = async () => {
         if (!multiplayerManager) return;
+        if (!isTcpSocketsAvailable()) {
+            Alert.alert(
+                'LAN multiplayer unavailable',
+                'Expo Go does not include TCP sockets. Build a native app: npx expo run:android'
+            );
+            return;
+        }
         setIsScanning(true);
         setFoundHosts([]);
         try {
-            const hosts = await multiplayerManager.scanLocalNetwork();
+            const port = parseInt(joinPort, 10) || DEFAULT_CHESS_PORT;
+            const hosts = await multiplayerManager.scanLocalNetwork(port);
             setFoundHosts(hosts);
         } catch {
             Alert.alert('Scan Failed', 'Could not scan local network.');
@@ -54,28 +142,89 @@ export default function GameScreen() {
         }
     };
 
-    const hostGame = async () => {
+    const createRoomAsHost = async () => {
         if (!multiplayerManager) return;
+        if (!isTcpSocketsAvailable()) {
+            Alert.alert(
+                'LAN multiplayer unavailable',
+                'Expo Go does not include TCP sockets. Build a native app: npx expo run:android'
+            );
+            return;
+        }
+        const ip = await getLanIPv4();
+        if (!ip) {
+            Alert.alert(
+                'No local IP',
+                'Connect to Wi‑Fi or turn on a mobile hotspot, then try again.'
+            );
+            return;
+        }
+        const pwd = hostRoomPassword.trim();
         try {
-            await multiplayerManager.startAsHost();
+            await multiplayerManager.startAsHost(DEFAULT_CHESS_PORT, pwd);
             setLocalColor('w');
-            setIsMultiplayerOpen(false);
-            Alert.alert('Hosting', 'You play White. Share hotspot; other device joins with your IP.');
-        } catch {
-            Alert.alert('Host Failed', 'Could not start host server.');
+            const url = buildInviteUrl(ip, DEFAULT_CHESS_PORT, pwd);
+            setInviteUrl(url);
+            setLocalIpShown(ip);
+            setHostHasPassword(pwd.length > 0);
+            setMpPanel('hostQr');
+            Alert.alert('Room is live', 'Share the QR or link with your guest (same network).');
+        } catch (e) {
+            if (e instanceof TcpModuleUnavailableError) {
+                Alert.alert('LAN multiplayer unavailable', e.message);
+                return;
+            }
+            console.warn(e);
+            Alert.alert(
+                'Could not create room',
+                'Port may be in use. Close other apps using the same port or restart the app.'
+            );
         }
     };
 
-    const joinGame = async (ip: string) => {
+    const joinGame = async (ipOverride?: string) => {
         if (!multiplayerManager) return;
-        try {
-            await multiplayerManager.startAsClient(ip);
-            setLocalColor('b');
-            setIsMultiplayerOpen(false);
-            Alert.alert('Joined', `Connected to ${ip}. You play Black.`);
-        } catch {
-            Alert.alert('Join Failed', `Could not connect to ${ip}`);
+        if (!isTcpSocketsAvailable()) {
+            Alert.alert(
+                'LAN multiplayer unavailable',
+                'Expo Go does not include TCP sockets. Build a native app: npx expo run:android'
+            );
+            return;
         }
+        const ip = (ipOverride ?? joinIp).trim();
+        const port = parseInt(joinPort, 10) || DEFAULT_CHESS_PORT;
+        if (!ip) {
+            Alert.alert('Missing IP', 'Enter the host IP or use an invite link / QR.');
+            return;
+        }
+        try {
+            await multiplayerManager.startAsClient(ip, port, joinRoomPassword.trim());
+            setLocalColor('b');
+            closeMultiplayerModal();
+            Alert.alert('Joined', `Connected to ${ip}. You play Black.`);
+        } catch (e) {
+            if (e instanceof TcpModuleUnavailableError) {
+                Alert.alert('LAN multiplayer unavailable', e.message);
+                return;
+            }
+            console.warn(e);
+            Alert.alert(
+                'Join failed',
+                'Check IP, port, room password, and that you are on the same Wi‑Fi / hotspot.'
+            );
+        }
+    };
+
+    const applyPastedInvite = () => {
+        const p = parseInviteFromPastedText(pasteInvite);
+        if (!p) {
+            Alert.alert('Invalid invite', 'Paste the full invite link or query string.');
+            return;
+        }
+        setJoinIp(p.ip);
+        setJoinPort(String(p.port));
+        setJoinRoomPassword(p.password);
+        Alert.alert('Invite loaded', 'Tap “Join as Black”.');
     };
 
     return (
@@ -84,11 +233,11 @@ export default function GameScreen() {
                 <View>
                     <Text style={[styles.title, { color: theme.colors.text }]}>Chess Offline</Text>
                     <Text style={[styles.subtitle, { color: theme.colors.textMuted }]}>
-                        {localColor ? 'Hotspot game' : `AI: ${aiLevel}`}
+                        {localColor ? 'Hotspot / LAN game' : `AI: ${aiLevel}`}
                     </Text>
                 </View>
                 <View style={styles.headerIcons}>
-                    <TouchableOpacity onPress={() => setIsMultiplayerOpen(true)}>
+                    <TouchableOpacity onPress={openMultiplayerModal}>
                         <Text style={[styles.settingsIcon, { marginRight: 20 }]}>🌐</Text>
                     </TouchableOpacity>
                     <TouchableOpacity onPress={() => setIsSettingsOpen(true)}>
@@ -143,69 +292,235 @@ export default function GameScreen() {
             </View>
 
             <Modal visible={isMultiplayerOpen} animationType="slide" transparent>
-                <View style={styles.modalOverlay}>
+                <KeyboardAvoidingView
+                    behavior={Platform.OS === 'ios' ? 'padding' : undefined}
+                    style={styles.modalOverlay}
+                >
                     <View style={[styles.modalContent, { backgroundColor: theme.colors.surface }]}>
                         <Text style={[styles.modalTitle, { color: theme.colors.text }]}>
-                            Multiplayer (hotspot / LAN)
-                        </Text>
-                        <Text style={[styles.hint, { color: theme.colors.textMuted }]}>
-                            Host plays White, client plays Black. Same Wi‑Fi or phone hotspot; no internet
-                            required.
+                            {mpPanel === 'hostQr' ? 'Your room' : 'Play together (offline LAN)'}
                         </Text>
 
-                        <TouchableOpacity
-                            style={[styles.hostButton, { backgroundColor: theme.colors.accent }]}
-                            onPress={hostGame}
-                        >
-                            <Text style={styles.buttonText}>Host game (White)</Text>
-                        </TouchableOpacity>
-
-                        <Text style={[styles.sectionTitle, { color: theme.colors.text, marginTop: 24 }]}>
-                            Join game
-                        </Text>
-                        <TouchableOpacity
-                            style={[styles.scanButton, { borderColor: theme.colors.accent }]}
-                            onPress={startScanning}
-                            disabled={isScanning}
-                        >
-                            {isScanning ? (
-                                <ActivityIndicator color={theme.colors.accent} />
-                            ) : (
-                                <Text style={{ color: theme.colors.accent, fontWeight: '600' }}>
-                                    Scan subnet for hosts
-                                </Text>
-                            )}
-                        </TouchableOpacity>
-
-                        <ScrollView style={styles.hostList}>
-                            {foundHosts.map(ip => (
+                        {mpPanel === 'hostQr' ? (
+                            <>
+                                <RoomInvitePanel
+                                    inviteUrl={inviteUrl}
+                                    localIp={localIpShown}
+                                    port={DEFAULT_CHESS_PORT}
+                                    hasPassword={hostHasPassword}
+                                    onCopyLink={() =>
+                                        Alert.alert('Copied', 'Send the link to your guest.')
+                                    }
+                                />
                                 <TouchableOpacity
-                                    key={ip}
-                                    style={[
-                                        styles.hostItem,
-                                        { backgroundColor: theme.colors.background },
-                                    ]}
-                                    onPress={() => joinGame(ip)}
+                                    style={[styles.closeButton, { backgroundColor: theme.colors.accent }]}
+                                    onPress={() => {
+                                        setMpPanel('menu');
+                                    }}
                                 >
-                                    <Text style={{ color: theme.colors.text }}>Host at {ip}</Text>
-                                    <Text style={{ color: theme.colors.accent }}>Join (Black)</Text>
+                                    <Text style={styles.buttonText}>Back</Text>
                                 </TouchableOpacity>
-                            ))}
-                            {!isScanning && foundHosts.length === 0 && (
-                                <Text style={[styles.emptyText, { color: theme.colors.textMuted }]}>
-                                    No hosts found. Enter host IP on the same network, or start hosting.
+                                <TouchableOpacity
+                                    style={[styles.closeButton, { backgroundColor: theme.colors.background }]}
+                                    onPress={() => {
+                                        endMultiplayerSession();
+                                        closeMultiplayerModal();
+                                    }}
+                                >
+                                    <Text style={[styles.buttonText, { color: theme.colors.text }]}>
+                                        Close room & exit
+                                    </Text>
+                                </TouchableOpacity>
+                            </>
+                        ) : (
+                            <ScrollView keyboardShouldPersistTaps="handled">
+                                <Text style={[styles.hint, { color: theme.colors.textMuted }]}>
+                                    Host creates a room (optional password). Guest joins with IP or by
+                                    scanning the QR / opening the invite link.
                                 </Text>
-                            )}
-                        </ScrollView>
+                                {!isTcpSocketsAvailable() ? (
+                                    <Text style={[styles.warnBanner, { color: theme.colors.error }]}>
+                                        LAN multiplayer needs a native build (run npx expo run:android). Expo
+                                        Go does not include TCP — you will get errors if you try to host or
+                                        join here.
+                                    </Text>
+                                ) : null}
 
-                        <TouchableOpacity
-                            style={[styles.closeButton, { backgroundColor: theme.colors.background }]}
-                            onPress={() => setIsMultiplayerOpen(false)}
-                        >
-                            <Text style={[styles.buttonText, { color: theme.colors.text }]}>Close</Text>
-                        </TouchableOpacity>
+                                <Text style={[styles.sectionTitle, { color: theme.colors.text }]}>
+                                    Host (White)
+                                </Text>
+                                <Text style={[styles.fieldLabel, { color: theme.colors.textMuted }]}>
+                                    Room password (optional — leave empty for open room)
+                                </Text>
+                                <TextInput
+                                    style={[
+                                        styles.input,
+                                        {
+                                            color: theme.colors.text,
+                                            borderColor: theme.colors.accent + '66',
+                                            backgroundColor: theme.colors.background,
+                                        },
+                                    ]}
+                                    placeholder="Empty = anyone on same Wi‑Fi can join"
+                                    placeholderTextColor={theme.colors.textMuted}
+                                    secureTextEntry
+                                    value={hostRoomPassword}
+                                    onChangeText={setHostRoomPassword}
+                                    autoCapitalize="none"
+                                    autoCorrect={false}
+                                />
+                                <TouchableOpacity
+                                    style={[styles.hostButton, { backgroundColor: theme.colors.accent }]}
+                                    onPress={createRoomAsHost}
+                                >
+                                    <Text style={styles.buttonText}>Create room & show QR</Text>
+                                </TouchableOpacity>
+
+                                <Text style={[styles.sectionTitle, { color: theme.colors.text, marginTop: 24 }]}>
+                                    Guest (Black)
+                                </Text>
+                                <Text style={[styles.fieldLabel, { color: theme.colors.textMuted }]}>
+                                    Paste invite (from QR or copy)
+                                </Text>
+                                <TextInput
+                                    style={[
+                                        styles.input,
+                                        {
+                                            color: theme.colors.text,
+                                            borderColor: theme.colors.accent + '66',
+                                            backgroundColor: theme.colors.background,
+                                        },
+                                    ]}
+                                    placeholder="chessoffline://join?..."
+                                    placeholderTextColor={theme.colors.textMuted}
+                                    value={pasteInvite}
+                                    onChangeText={setPasteInvite}
+                                    autoCapitalize="none"
+                                    autoCorrect={false}
+                                />
+                                <TouchableOpacity
+                                    style={[styles.scanButton, { borderColor: theme.colors.accent }]}
+                                    onPress={applyPastedInvite}
+                                >
+                                    <Text style={{ color: theme.colors.accent, fontWeight: '600' }}>
+                                        Apply pasted invite
+                                    </Text>
+                                </TouchableOpacity>
+
+                                <Text style={[styles.fieldLabel, { color: theme.colors.textMuted }]}>
+                                    Or enter manually
+                                </Text>
+                                <TextInput
+                                    style={[
+                                        styles.input,
+                                        {
+                                            color: theme.colors.text,
+                                            borderColor: theme.colors.accent + '66',
+                                            backgroundColor: theme.colors.background,
+                                        },
+                                    ]}
+                                    placeholder="Host IP e.g. 192.168.43.1"
+                                    placeholderTextColor={theme.colors.textMuted}
+                                    value={joinIp}
+                                    onChangeText={setJoinIp}
+                                    keyboardType="decimal-pad"
+                                />
+                                <TextInput
+                                    style={[
+                                        styles.input,
+                                        {
+                                            color: theme.colors.text,
+                                            borderColor: theme.colors.accent + '66',
+                                            backgroundColor: theme.colors.background,
+                                        },
+                                    ]}
+                                    placeholder="Port"
+                                    placeholderTextColor={theme.colors.textMuted}
+                                    value={joinPort}
+                                    onChangeText={setJoinPort}
+                                    keyboardType="number-pad"
+                                />
+                                <TextInput
+                                    style={[
+                                        styles.input,
+                                        {
+                                            color: theme.colors.text,
+                                            borderColor: theme.colors.accent + '66',
+                                            backgroundColor: theme.colors.background,
+                                        },
+                                    ]}
+                                    placeholder="Room password (if host set one)"
+                                    placeholderTextColor={theme.colors.textMuted}
+                                    secureTextEntry
+                                    value={joinRoomPassword}
+                                    onChangeText={setJoinRoomPassword}
+                                    autoCapitalize="none"
+                                />
+                                <TouchableOpacity
+                                    style={[styles.hostButton, { backgroundColor: theme.colors.accent }]}
+                                    onPress={() => joinGame()}
+                                >
+                                    <Text style={styles.buttonText}>Join as Black</Text>
+                                </TouchableOpacity>
+
+                                <Text style={[styles.sectionTitle, { color: theme.colors.text, marginTop: 20 }]}>
+                                    Find hosts (same subnet)
+                                </Text>
+                                <TouchableOpacity
+                                    style={[styles.scanButton, { borderColor: theme.colors.accent }]}
+                                    onPress={startScanning}
+                                    disabled={isScanning}
+                                >
+                                    {isScanning ? (
+                                        <ActivityIndicator color={theme.colors.accent} />
+                                    ) : (
+                                        <Text style={{ color: theme.colors.accent, fontWeight: '600' }}>
+                                            Scan for rooms
+                                        </Text>
+                                    )}
+                                </TouchableOpacity>
+                                <ScrollView style={styles.hostList} nestedScrollEnabled>
+                                    {foundHosts.map(ip => (
+                                        <TouchableOpacity
+                                            key={ip}
+                                            style={[
+                                                styles.hostItem,
+                                                { backgroundColor: theme.colors.background },
+                                            ]}
+                                            onPress={() => joinGame(ip)}
+                                        >
+                                            <Text style={{ color: theme.colors.text }}>Room at {ip}</Text>
+                                            <Text style={{ color: theme.colors.accent }}>Join</Text>
+                                        </TouchableOpacity>
+                                    ))}
+                                </ScrollView>
+
+                                {localColor === 'w' && (
+                                    <TouchableOpacity
+                                        style={[styles.endBtn, { borderColor: theme.colors.error }]}
+                                        onPress={() => {
+                                            endMultiplayerSession();
+                                            closeMultiplayerModal();
+                                        }}
+                                    >
+                                        <Text style={{ color: theme.colors.error, fontWeight: '600' }}>
+                                            End hosting
+                                        </Text>
+                                    </TouchableOpacity>
+                                )}
+                            </ScrollView>
+                        )}
+
+                        {mpPanel === 'menu' && (
+                            <TouchableOpacity
+                                style={[styles.closeButton, { backgroundColor: theme.colors.background }]}
+                                onPress={closeMultiplayerModal}
+                            >
+                                <Text style={[styles.buttonText, { color: theme.colors.text }]}>Close</Text>
+                            </TouchableOpacity>
+                        )}
                     </View>
-                </View>
+                </KeyboardAvoidingView>
             </Modal>
 
             <Modal visible={isSettingsOpen} animationType="slide" transparent>
@@ -214,9 +529,7 @@ export default function GameScreen() {
                         <Text style={[styles.modalTitle, { color: theme.colors.text }]}>Settings</Text>
 
                         <ScrollView>
-                            <Text style={[styles.sectionTitle, { color: theme.colors.text }]}>
-                                Board theme
-                            </Text>
+                            <Text style={[styles.sectionTitle, { color: theme.colors.text }]}>Board theme</Text>
                             <View style={styles.themeGrid}>
                                 {Object.keys(Themes).map(t => (
                                     <TouchableOpacity
@@ -322,12 +635,18 @@ const styles = StyleSheet.create({
         borderTopLeftRadius: 20,
         borderTopRightRadius: 20,
         padding: 20,
-        maxHeight: '90%',
+        maxHeight: '92%',
     },
     hint: {
         fontSize: 14,
         lineHeight: 20,
         marginBottom: 16,
+    },
+    warnBanner: {
+        fontSize: 14,
+        lineHeight: 20,
+        marginBottom: 14,
+        fontWeight: '600',
     },
     modalTitle: {
         fontSize: 22,
@@ -338,8 +657,20 @@ const styles = StyleSheet.create({
     sectionTitle: {
         fontSize: 18,
         fontWeight: '600',
-        marginTop: 16,
+        marginTop: 8,
+        marginBottom: 8,
+    },
+    fieldLabel: {
+        fontSize: 13,
+        marginBottom: 6,
+    },
+    input: {
+        borderWidth: 1,
+        borderRadius: 10,
+        paddingHorizontal: 14,
+        paddingVertical: 12,
         marginBottom: 10,
+        fontSize: 16,
     },
     themeGrid: {
         flexDirection: 'row',
@@ -354,25 +685,25 @@ const styles = StyleSheet.create({
         alignItems: 'center',
     },
     closeButton: {
-        marginTop: 24,
+        marginTop: 16,
         padding: 15,
         borderRadius: 10,
         alignItems: 'center',
     },
     hostButton: {
-        padding: 18,
+        padding: 16,
         borderRadius: 12,
         alignItems: 'center',
     },
     scanButton: {
-        padding: 15,
+        padding: 14,
         borderWidth: 1,
         borderRadius: 10,
         alignItems: 'center',
         marginBottom: 12,
     },
     hostList: {
-        maxHeight: 200,
+        maxHeight: 160,
     },
     hostItem: {
         flexDirection: 'row',
@@ -381,9 +712,11 @@ const styles = StyleSheet.create({
         borderRadius: 10,
         marginBottom: 10,
     },
-    emptyText: {
-        textAlign: 'center',
-        marginVertical: 16,
-        fontSize: 14,
+    endBtn: {
+        marginTop: 20,
+        padding: 14,
+        borderRadius: 10,
+        borderWidth: 1,
+        alignItems: 'center',
     },
 });

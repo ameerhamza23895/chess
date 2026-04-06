@@ -117,8 +117,10 @@ const ChessBoard = forwardRef<ChessBoardRef, ChessBoardProps>(
             const handleRemoteMove = (...args: unknown[]) => {
                 const moveStr = args[0];
                 if (typeof moveStr !== 'string') return;
+                const san = moveStr.trim();
+                if (!san) return;
                 try {
-                    const move = game.move(moveStr);
+                    const move = game.move(san);
                     if (move) {
                         setLastMove({ from: move.from, to: move.to });
                         if (move.captured) soundManager.playCapture();
